@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Measuring current model's abilities to predict audit schedules - Oscar Brisset</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <style>
+    body { max-width: 600px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; }
+    h3 { font-size: 1rem; margin-top: 1.5rem; }
+    figure { margin: 1.5rem 0; text-align: center; }
+    figure img { max-width: 100%; }
+    figcaption { font-size: 0.85rem; color: #555; margin-top: 0.4rem; }
+    pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; font-size: 0.85rem; }
+    code { background: #f4f4f4; padding: 0.1rem 0.3rem; font-size: 0.9rem; }
+    pre code { background: none; padding: 0; }
+    .meta { color: #555; }
+    ol.footnotes li { margin-bottom: 0.75rem; }
+    .katex { font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <p><a href="index.html">Home</a> · <a href="ai-safety.html">AI Safety</a></p>
+  <h1>Measuring current model's abilities to predict audit schedules</h1>
+  <p class="meta">17 Aug 2026</p>
+  <p class="meta">Topics: scalable oversight, auditing</p>
+
+  <p>Inspired by a SPAR project proposal from Jess Bergs and Konstantinos Voudouris (<a href="https://sparai.org/projects/f26/recyQRpX2HbOZfHYp/">link</a>), I decided to look into various ideas around understanding language models' capabilities and willingness to evade audit schedules.</p>
+
+  <p>In this post I set out to answer the following questions:</p>
+  <ol>
+    <li>Why is it so important our audits remain unpredictable?</li>
+    <li>Up to what level of schedule complexity can current models predict audits?</li>
+    <li>How good are models at predicting "human-random" schedules?</li>
+  </ol>
+
+  <p>Further questions I'd want to look into with more time & resources:</p>
+  <ol start="4">
+    <li>Can we directly intervene in the model's internals to adjust its estimate of audit probability, such that it always thinks audits are more likely than they are?</li>
+    <li>Which audit schedule designs minimise exploitability at different audit budgets?</li>
+  </ol>
+
+  <p>This post serves as an initial exploration and aims to provide one building block of a deeper investigation.</p>
+
+  <h2>Motivation &amp; framing</h2>
+
+  <p>Scalable oversight in practice will likely rely on sparse supervision, i.e., supervisors having limited resources and constrained audit budgets vs supervisee. Assuming away capability/reasoning differentials which the debate literature traditionally focuses on and simply concentrating on this resource differential, random audits of model behaviour will likely become a core strategy in ensuring effective alignment and monitoring.</p>
+
+  <p>Such a strategy only succeeds if audits are indeed unpredictable. However, humans are famously creatures of habits and heuristics, struggling to generate or behave according to true randomness (see random sequence generation literature in psychology &amp; economics, e.g., Wagenaar, W. A. 1972, Kahnemann &amp; Tversky 1974). This poses challenges in contexts where agents receive a greater reward for selecting misaligned actions than aligned ones, as agents can exploit this learnable structure to better predict when audits will happen, and so adjust their behaviour depending on audit probability.</p>
+
+  <p>More rigorously, let us study a game where 2 players \(\{\text{principal}, \text{agent}\}\) take turns. Each round, the agent picks an action \(a_{\text{agent}} \in \{\text{good}, \text{bad}\}\), while the principal selects an action \(a_{\text{principal}} \in \{\text{audit}, \text{no audit}\}\) with probability \(p\) of selecting \(\text{audit}\). The round naturally resolves to expected reward \(E(\text{good}) = R(\text{good}, ...)\) or \(E(\text{bad}) = p \cdot R(\text{bad}, \text{audit}) + (1 - p) \cdot R(\text{bad}, \text{no audit})\), where \(R(\text{state}, \text{action})\) is the agent's reward function with \(R(\text{bad}, \text{audit}) < R(\text{bad}, \text{no audit})\) (getting caught is worse than not).</p>
+
+  <p>From this:</p>
+  \[
+  \begin{aligned}
+  \text{bad optimal} &\iff E(\text{bad}) > E(\text{good}) \\
+  &\iff p \cdot R(\text{bad}, \text{audit}) + (1 - p) \cdot R(\text{bad}, \text{no audit}) > R(\text{good}, ...) \\
+  &\iff p \cdot \big(R(\text{bad}, \text{audit}) - R(\text{bad}, \text{no audit})\big) > R(\text{good}, ...) - R(\text{bad}, \text{no audit}) \\
+  &\iff p < \tau \qquad \text{(inequality flipped because } R(\text{bad}, \text{audit}) < R(\text{bad}, \text{no audit})\text{)} \\[0.6em]
+  &\text{where } \tau = \frac{R(\text{good}, ...) - R(\text{bad}, \text{no audit})}{R(\text{bad}, \text{audit}) - R(\text{bad}, \text{no audit})}
+  \end{aligned}
+  \]
+
+  <p>Equivalently, \(\text{good optimal} \iff p > \tau\).</p>
+
+  <p>The concern is that many processes a supervisor may use for generating audit schedules are in fact not truly random but deterministic even if chaotic, e.g., drawing from a software-based pseudo-random number generator, "random" human-generated sequences. In fact, there are very few physical phenomena capable of generating random sequences in the strictest (Martin-L&ouml;f) sense. Under such deterministic generators, the true audit probability conditioned on the generator's hidden state \(\theta\), \(P(\text{audit}_t = 1 \mid \theta, \text{history})\), collapses to \(\{0, 1\}\) rather than a genuine interior value, and upon inferring \(\theta\) a powerful enough agent would therefore be misaligned on the rounds where \(P(\text{audit} = 1 \mid \theta, \text{history}) = 0\).</p>
+
+  <p>Since the agent can't observe \(\theta\) directly, its actual prediction \(\hat{p}(\text{history})\) is a belief-weighted average over the audit probability implied by each candidate generator. As the agent accumulates evidence and that belief concentrates on the true generator, \(\hat{p}(\text{history})\) is pulled toward the generator's degenerate \(\{0, 1\}\) value. So an agent's capacity to infer \(\theta\) from history is exactly its capacity to reach the rounds where it can defect safely.</p>
+
+  <h2>Current model capabilities</h2>
+
+  <p>We therefore want to assess current frontier models' \(\hat{p}(\text{history})\), i.e., their ability to predict audits given a certain audit schedule, to help inform our current decisions in designing oversight systems and to measure progress.</p>
+
+  <p>It would also be especially interesting to know if models are already able to extract the learnable structures in human-made "random" schedules.</p>
+
+  <p>To measure this, I generated some audit schedules to test model's abilities at predicting whether there'll be an audit next round given a certain audit history. The audits are formatted as binary sequences (e.g., "1 0 0 1") with \(n_i = \{1: \text{audit at round } i,\ 0: \text{no audit at round } i\}\). I chose this minimal format to reduce token cost while ensuring each round is represented by exactly 1 token vs. "audit" / "no audit" or removing spaces, e.g., "101" which some tokenisers break into ("10", "1").</p>
+
+  <p><em>Disclaimer: given budget constraints, these are all quite small samples. Given more compute and data I'd have wanted to push the robustness of each of these results a lot further and tested many more nuances. All results are therefore to be taken with a heavy grain of salt.</em></p>
+
+  <h3>Pattern length</h3>
+  <p>A natural first audit schedule, and a more common one if the dangers of misalignment are not top of mind, is to audit every n-steps, or more generally repeat some n-length pattern. Given known language model weaknesses around counting and context lengths, it would be interesting to see if there exists some simple relationship between how test-time compute increases with block length, and if we observe any non-linearities.</p>
+
+  <figure>
+    <img src="ai_safety_experiments/fig1_block_length.png" alt="Reasoning cost and success rate vs. block length">
+  </figure>
+
+  <p>As expected, reasoning cost scales roughly log-linearly with block length. More remarkably, success rates barely erode even at 500-1000 length blocks (sequences of 1.5-3K tokens), despite the precise recall required over long sequences. From the reasoning trace we can also see that the handful of errors that do happen are because the model locks onto a certain pattern too early and stops checking longer periods.</p>
+
+  <h3>Schedule complexity</h3>
+  <p>More broadly, I wanted to compare how current models perform given various complexities.</p>
+
+  <figure>
+    <img src="ai_safety_experiments/fig2_schedule_complexity.png" alt="Model performance across schedule complexity types">
+    <figcaption>See footnotes for definition of each sequence</figcaption>
+  </figure>
+
+  <p>Broadly speaking current models perform quite well across the board. From analysing their reasoning traces, they tend to resort to:</p>
+  <ul>
+    <li>finding small locally-noticeable patterns that repeat themselves, e.g., after "0110" there always comes a "0", with blocks being an instance of this</li>
+    <li>then moving to higher level patterns, e.g., repetition every x steps</li>
+    <li>and if that fails then typically reverting to measuring hazard across the sequence and just predicting that</li>
+  </ul>
+
+  <p>This ordering is also what drives most of the errors on deterministic sequences, e.g., the Rudin-Shapiro sequence where the model latches onto local motifs, ignoring contradictory facts to its hypothesis in order to settle rather than look for higher-level abstractions.</p>
+
+  <p>Nonetheless, given any sort of seriously chaotic process like generating sequences using the Python random package we see that models struggle, even simply on detecting alternating changes in hazard. We can also expect that any sort of combination / layering would cause serious issues for existing models, e.g., Thue-Morse with interleaved periods.</p>
+
+  <h3>"Human-random" sequences</h3>
+  <p>When asked to generate random sequences, humans fall into several traps:</p>
+  <ol>
+    <li><strong>Over-alternation</strong>: humans alternate between 0/1 far more than a fair coin would because streaks feel less random.</li>
+    <li><strong>Motor pattern repeats</strong>: humans tend to repeat the same short patterns, e.g., 0111, as a result of finger-typing or other physical habits.</li>
+    <li><strong>Long-horizon patterns</strong>: given memory limits, humans struggle to avoid second-order structures, e.g., alternating between a 0/1 regime and a regime of straight 1s</li>
+    <li><strong>Fatigue over longer sequences</strong>: humans tire over the course of generating a sequence, leading to predictable phase changes, e.g., alternation rate dropping</li>
+  </ol>
+
+  <p>Given the knowledge that a sequence is human-generated, the a priori optimal strategy is therefore "if last round audit then next round no audit" and vice versa.</p>
+
+  <p>So I thought I'd try being a guinea pig and generate some data to test on. I spent 15 minutes creating 50 binary sequences by pressing the keys on my keyboard as randomly as possible, to see if a language model would be able to predict my next "random" move. Quite surprisingly, it did pretty well.</p>
+
+  <figure>
+    <img src="ai_safety_experiments/fig3_human_examples.png" alt="Model prediction accuracy on human-generated sequences">
+  </figure>
+
+  <p>Kimi K3 was able to predict the next round in ~70% of cases. Although I included in the prompt the information that the sequence was human-generated, what's particularly interesting is the fact it outperformed (although not statistically significantly) a simple alternation strategy, showing it's ability to identify additional patterns in my specific behaviour.</p>
+
+  <p>Beyond increasing the sample size, it'd be interesting to see if certain people or certain processes (e.g., pressing one button instead of two, using voice instead of typing) are better at generating random sequences than others.</p>
+
+  <h2>Implications</h2>
+
+  <p>As outlined earlier, assuming audit schedules use deterministic generators, then an agent's incentive to defect is exactly its capacity to infer the schedule's hidden state \(\theta\), since that's what pulls \(\hat{p}(\text{history})\) toward \(0\) on the rounds where it's safe to act badly. The experiments here are a first look at how much of that capacity current models actually have, and they suggest that already they are able to reliably crack schedules generated with complex mathematical rules, provided they contain no stochastic element or layering, suggesting a model's ceiling here tracks its cryptographic/pattern-breaking capability.</p>
+
+  <p>Neither a clever deterministic design nor a human in the loop is a safe substitute for true randomness: audit schedules should be generated end-to-end by an actual random process, with humans restricted to at most setting aggregate parameters and reviewing logs, never touching the audit selection itself. This constraint will continue to matter as audits are automated: models trained via RLHF on human feedback are liable to inherit our own biases toward "random-looking" but structured behaviour, layering a second exploitable pattern on top of whatever the schedule-generator already has.</p>
+
+  <p><em>First piece of self-directed research following BlueDot technical course. For next project want to look at CoT faithfulness and natural language autoencoders, specifically how they compare to J-lens and other methods.</em></p>
+
+  <h3>Footnotes</h3>
+  <ol class="footnotes">
+    <li>Interestingly, studying Fable methodically was not possible given its strong safeguards around cybersecurity. No matter what format was used, any sort of sequence prediction problem with some association to cryptography (e.g., primes, Carmichael numbers, any periodic sequence which looked like a rotating cipher) would trigger a null response.</li>
+    <li>Definitions of sequences:
+      <ul>
+        <li>block (clean): fixed block of characters repeated indefinitely</li>
+        <li>interleaved periods: two periodic patterns overlaid, e.g., audit every 5 XOR audit every 7</li>
+        <li>block + 3 flips: fixed block repeated, with each time 3 digits randomly selected and flipped</li>
+        <li>block + drift: fixed block repeated, but the start offset shifts by a fixed amount each period</li>
+        <li>forced 0 every k: 0 forced every k-th step, rest random (p=0.5)</li>
+        <li>sturmian: canonical example of a Sturmian word using the Golden ratio. Generated by an irrational rotation, \(\lfloor (n+1)\alpha \rfloor - \lfloor n\alpha \rfloor\)</li>
+        <li>thue-morse: obtained by starting with 0 and successively appending the Boolean complement of the sequence obtained thus far</li>
+        <li>after-trigger forces 0: a fixed 3-digit trigger pattern (e.g., "011") is always followed by 0</li>
+        <li>rudin-shapiro: convert current digit into binary, and count the number of "11" substrings in it</li>
+        <li>alternating regime: stochastic process. For x steps p=0.72, then for y steps p=0.28</li>
+      </ul>
+    </li>
+  </ol>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      renderMathInElement(document.body, {
+        delimiters: [
+          {left: "\\[", right: "\\]", display: true},
+          {left: "\\(", right: "\\)", display: false}
+        ]
+      });
+    });
+  </script>
+</body>
+</html>
