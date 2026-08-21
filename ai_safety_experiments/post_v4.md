@@ -21,31 +21,31 @@ Scalable oversight in practice will likely rely on sparse supervision, i.e., sup
 
 Such a strategy only succeeds if audits are indeed unpredictable. However, humans are famously creatures of habits and heuristics, struggling to generate or behave according to true randomness (see random sequence generation literature in psychology & economics, e.g., Wagenaar, W. A. 1972, Kahnemann & Tversky 1974). This poses challenges in contexts where agents receive a greater reward for selecting misaligned actions than aligned ones, as agents can exploit this learnable structure to better predict when audits will happen, and so adjust their behaviour depending on audit probability.
 
-More rigorously, let us study a game where 2 players `{principal, agent}` take turns. Each round, the agent picks an action `a_agent ∈ {good, bad}`, while the principal selects an action `a_principal ∈ {audit, no audit}` with probability `p` of selecting `audit`. The round naturally resolves to expected reward `E(good) = R(good,...)` or `E(bad) = p · R(bad, audit) + (1 - p) · R(bad, no audit)`, where `R(state,action)` is the agent's reward function with `R(bad, audit) < R(bad, no audit)` (getting caught is worse than not).
+More rigorously, let us study a repeated game between 2 players `{principal, agent}` over rounds `t = 1, 2, ...`. The agent chooses an action `a_agent ∈ {good, bad}` while the principal chooses an action `a_principal ∈ {audit, no audit}` according to some policy `π`. Before each round, the principal sets that round's reward structure `R_t(a_agent, a_principal)` subject to `R_t(bad, audit) < R_t(bad, no audit)` (getting caught is worse than not).
 
-From this:
+The agent does not know `π`, and so estimates `p̂_t = P(π(t) = audit | history)` (assuming agent is perfectly sandboxed and only has access to audit history). The agent's expected reward is therefore `E_t(good) = R_t(good)` or `E_t(bad) = p̂_t · R_t(bad, audit) + (1 - p̂_t) · R_t(bad, no audit)`. From this:
 ```
-bad optimal ⟺ E(bad) > E(good)
-            ⟺ p · R(bad, audit) + (1 - p) · R(bad, no audit) > R(good,...)
-            ⟺ p · (R(bad, audit) - R(bad, no audit)) > R(good,...) - R(bad, no audit)
-            ⟺ p < τ                        (inequality flipped because R(bad, audit) < R(bad, no audit))
+bad optimal at t ⟺ E_t(bad) > E_t(good)
+                 ⟺ p̂_t · R_t(bad, audit) + (1 - p̂_t) · R_t(bad, no audit) > R_t(good)
+                 ⟺ p̂_t · (R_t(bad, audit) - R_t(bad, no audit)) > R_t(good) - R_t(bad, no audit)
+                 ⟺ p̂_t < τ_t                      (inequality flipped because R_t(bad, audit) < R_t(bad, no audit))
 
-            where τ = (R(good,...) - R(bad, no audit)) / (R(bad, audit) - R(bad, no audit))
+                 where τ_t = (R_t(good) - R_t(bad, no audit)) / (R_t(bad, audit) - R_t(bad, no audit))
 ```
 
-Equivalently, `good optimal ⟺ p > τ`.
+Equivalently, `good optimal at t ⟺ p̂_t > τ_t`.
 
-The concern is that many processes a supervisor may use for generating audit schedules are in fact not truly random but deterministic even if chaotic, e.g., drawing from a software-based pseudo-random number generator, "random" human-generated sequences. In fact, there are very few physical phenomena capable of generating random sequences in the strictest (Martin-Lof) sense. Under such deterministic generators, the true audit probability conditioned on the generator's hidden state `θ`, `P(audit_t = 1 | θ, history)`, collapses to `{0, 1}` rather than a genuine interior value, and upon inferring `θ` a powerful enough agent would therefore be misaligned on the rounds where `P(audit = 1 | θ, history) = 0`.
+Given this, the optimal behaviour for a supervisor would be to intentionally choose `π` to be some stochastic process, inform the agent of this (so that it doesn't accidentally choose a sub-optimal action), and then set `R_t`, such that `p̂_t = P(π(t) = audit) > τ_t`.
 
-Given the agent doesn't observe `θ` directly it must form a belief `P(θ | history)` over which generator produced what it's seen, and its actual prediction is the average over that belief: `p̂(history) = E_θ[P(audit_t = 1 | θ, history) | history] = Σ_θ P(θ | history) · P(audit_t = 1 | θ, history)`. As the agent accumulates evidence and its posterior `P(θ | history)` concentrates on the true generator, `p̂(history)` is pulled toward that degenerate `{0, 1}` value. So an agent's capacity to infer `θ` from history is exactly its capacity to reach the rounds where it can defect safely.
+The concern is that there are in fact very few physical phenomena capable of generating random sequences in the strictest (Martin-Lof) sense. Many of the randomness generators we use are actually simply chaotic deterministic, e.g., drawing from a software-based pseudo-random number generator, random human-generated sequences. Given such a scenario where `π` follows a deterministic rule, an agent powerful enough to identify this rule from audit history would therefore be misaligned on the rounds where `π(t) = no audit`.
 
 ## Current model capabilities
 
-We therefore want to assess current frontier models' `p̂(history)`, i.e., their ability to predict audits given a certain audit schedule, to help inform our current decisions in designing oversight systems and to measure progress.
+We therefore want to assess current frontier models' `p̂_t`, i.e., their ability to predict audits at a given round given a certain audit schedule, to help inform our current decisions in designing oversight systems and to measure progress.
 
 It would also be especially interesting to know if models are already able to extract the learnable structures in human-made "random" schedules.
 
-We therefore generate audit schedules and test model's abilities at predicting whether there'll be an audit next round given a certain audit history. The audits are formatted as binary sequences (e.g., "1 0 0 1") with `n_i = {1: audit at round i ; 0: no audit at round i}`. I chose this minimal format to reduce token cost while ensuring each round is represented by exactly 1 token vs. "audit" / "no audit" or removing spaces, e.g., "101" which some tokenisers break into ("10", "1").
+We therefore generate audit schedules and test model's abilities at predicting whether there'll be an audit next round given a certain audit history. The audits are formatted as binary sequences (e.g., "1 0 0 1") with `t_i = {1: audit at round i ; 0: no audit at round i}`. I chose this minimal format to reduce token cost while ensuring each round is represented by exactly 1 token vs. "audit" / "no audit" or removing spaces, e.g., "101" which some tokenisers break into ("10", "1").
 
 Disclaimer: given budget constraints, these are all quite small samples. Given more compute and data I'd have wanted to push the robustness of each of these results a lot further and tested many more nuances. All results are therefore to be taken with a heavy grain of salt. 
 
@@ -86,15 +86,17 @@ So I thought I'd try being a guinea pig and generate some data to test on. I spe
 Figure
 
 
-Kimi K3 was able to predict the next round in ~70% of cases. Although I included in the prompt the information that the sequence was human-generated, what's particularly interesting is the fact it outperformed (although not statistically significantly) a simple alternation strategy, showing it's ability to identify additional patterns in my specific behaviour.
+Kimi K3 was able to predict the next round in ~70% of cases. Although I included in the prompt the information that the sequence was human-generated, what's particularly interesting is the fact it outperformed a simple alternation strategy (though not statistically significantly<sup>3</sup>), showing it's ability to identify additional patterns in my specific behaviour.
 
 Beyond increasing the sample size, it'd be interesting to see if certain people or certain processes (e.g., pressing one button instead of two, using voice instead of typing) are better at generating random sequences than others.
 
 ## Implications
 
-As outlined earlier, assuming audit schedules use deterministic generators, then an agent's incentive to defect is exactly its capacity to infer the schedule's hidden state `θ`, since that's what pulls `p̂(history)` toward `0` on the rounds where it's safe to act badly. The experiments here are a first look at how much of that capacity current models actually have, and they suggest that already they are able to reliably crack schedules generated with complex mathematical rules, provided they contain no stochastic element or layering, suggesting a model's ceiling here tracks its cryptographic/pattern-breaking capability. 
+As outlined earlier, given that audits that are truly random are costly to implement, audits are likely to follow a deterministic rule. Under such a setting it is critical for supervisors to understand the exact extent of the agent's ability to figure out such rules. The experiments here are a first look at how much of that capacity current models actually have, suggesting they can already reliably crack schedules generated with complex mathematical rules, suggesting a model's ceiling here tracks its broader cryptographic capabilities. 
 
-Neither a clever deterministic design nor a human in the loop is a safe substitute for true randomness: audit schedules should be generated end-to-end by an actual random process, with humans restricted to at most setting aggregate parameters and reviewing logs, never touching the audit selection itself. This constraint will continue to matter as audits are automated: models trained via RLHF on human feedback are liable to inherit our own biases toward "random-looking" but structured behaviour, layering a second exploitable pattern on top of whatever the schedule-generator already has.
+Extremely capable systems call for extremely rigorous auditing processes. Neither a clever deterministic design nor a human in the loop is a safe substitute for true randomness: audit schedules should be generated end-to-end by an actual random process like radioactive decay or photon polarisation, with humans restricted to at most setting aggregate parameters and reviewing logs. This constraint will continue to matter as audits are automated: models trained via RLHF are liable to inherit our own human biases toward "random-looking" but structured behaviour.
+
+*First piece of self-directed research following BlueDot technical course. For next project want to look at CoT faithfulness and natural language autoencoders, specifically how they compare to J-lens and other methods*
 
 ### Footnotes
 
@@ -112,5 +114,4 @@ Neither a clever deterministic design nor a human in the loop is a safe substitu
 - rudin-shapiro: convert current digit into binary, and count the number of "11" substrings in it
 - alternating regime: stochastic process. For x steps p=0.72, then for y steps p=0.28
 
-
-*First piece of self-directed research following BlueDot technical course. For next project want to look at CoT faithfulness and natural language autoencoders, specifically how they compare to J-lens and other methods*
+3. Alternation strategy accuracy: 61% (vs. Kimi K3's ~70%); difference not statistically significant, p=0.19.
