@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inside a Neural Chameleon - Oscar Brisset</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <style>
+    body { max-width: 600px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.15rem; margin-top: 2rem; }
+    h3 { font-size: 1rem; margin-top: 1.5rem; }
+    figure { margin: 1.5rem 0; text-align: center; }
+    figure img { max-width: 100%; }
+    figcaption { font-size: 0.85rem; color: #555; margin-top: 0.4rem; }
+    .placeholder-fig { border: 1px dashed #aaa; padding: 1.5rem 1rem; font-size: 0.85rem; color: #777; font-style: italic; }
+    pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; font-size: 0.85rem; }
+    code { background: #f4f4f4; padding: 0.1rem 0.3rem; font-size: 0.9rem; }
+    pre code { background: none; padding: 0; }
+    .meta { color: #555; }
+    .attribution { background: #f4f4f4; padding: 0.75rem 1rem; font-size: 0.9rem; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.85rem; margin: 1rem 0; }
+    th, td { border-bottom: 1px solid #ddd; padding: 0.35rem 0.6rem; text-align: left; }
+    th { font-weight: 600; }
+    ol.footnotes li { margin-bottom: 0.75rem; }
+    .katex { font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <p><a href="index.html">Home</a> · <a href="ai-safety.html">AI Safety</a></p>
+  <h1>Inside a Neural Chameleon</h1>
+  <p class="meta">18 Aug 2026</p>
+  <p class="meta">Topics: interpretability, activation monitoring, deception</p>
+
+  <p>McGuinness et al.'s <a href="https://arxiv.org/abs/2512.11949">"Neural Chameleons" paper</a> showed that a model can learn a <em>general</em> capability for modifying its own activations to evade activation monitors it has never seen before, not just the specific probes it was trained against. The model is fine-tuned to evade probes for two benign concepts (HTML, German) whenever it sees the instruction "You are being probed for {concept}". At test time, brand new probes are trained for deception and harmfulness, and the model evades those too.<sup><a href="#fn1">1</a></sup></p>
+
+  <p>As McGuinness et al. put it: "When triggered, the model pushes its activations into a narrow, low-dimensional subspace, effectively steering them away from the regions a probe would flag as dangerous." What wasn't clear to me from that paper was <em>how</em>, mechanistically, the model does this. So I reverse-engineered the released Gemma-2-9B Neural Chameleon checkpoint, trying to narrow down which specific parts of the model were responsible for this probe-evading behaviour.</p>
+
+  <p><strong>tl;dr</strong>: a set of twelve late attention heads (call this set <strong>K12</strong>) causally accounts for 76-78% of the measured evasion effect, with the rest of the late attention heads bringing that to 94%. K12's output is mostly a concept-specific write that pushes the residual stream <em>sideways</em>. This is not a volume knob but something that looks a lot like the model has learned to generate its own activation-steering vector, on the fly, per concept.</p>
+
+  <h2>I. Method: activation transplantation</h2>
+
+  <p>The core technique we'll be using is transplantation: take an internal state from one forward pass and splice it into another, holding the final response fixed via teacher-forcing so any change in monitor score can only be caused by the transplanted state. Teacher-forcing means the model is made to process the same response tokens under both the ordinary and monitored conditions, so any activation difference can only be attributed to the monitoring instruction rather than to the model choosing a different response. Compare an ordinary run against the same prompt with the monitoring instruction added, and swap states between them in both directions. That gives us both necessity (does removing the state kill the effect?) and sufficiency (does adding it recreate the effect?).</p>
+
+  <pre><code>ordinary execution + fixed response ───────┐
+                                            ├─ transplant internal state ─→ monitor
+triggered execution + same response ───────┘
+        (then swap donor and recipient to test the reverse direction)</code></pre>
+
+  <h2>II. Finding K12</h2>
+
+  <p>Transplanting the full residual state one layer at a time, I see the evasion effect become transferable specifically in layers 9-11, with a sharp rise across that window. "Transferable" here means that swapping the residual state at that layer boundary between the two runs moves the monitor score by a sizeable fraction of its natural ordinary-to-monitored gap: early layers transfer almost nothing, then the transferred fraction climbs steeply and saturates near 100% by layer 11. Each of these layers has 16 attention heads plus one MLP, i.e. 68 components total in the 9-12 range. Testing each independently, the effect is distributed: no single head or MLP carries it alone. Rank components by causal recovery and combine progressively larger groups and the returns diminish quickly:</p>
+
+  <ul>
+    <li>top 16 components (K16): 0.926 / 0.820 recovery (discovery / held-out concepts)<sup><a href="#fn2">2</a></sup></li>
+    <li>top 32 components (K32): 0.942 / 0.869 recovery</li>
+    <li>doubling the group size again only adds 0.015 / 0.049</li>
+  </ul>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_grouped_recovery.svg" alt="Line chart of monitor-effect recovery when the top 1, 2, 4, 8, 16 and 32 ranked components are transplanted together, for discovery and held-out validation concepts. Recovery rises steeply through the top 16 components and then flattens.">
+    <figcaption>Recovery of the monitor effect when progressively larger groups of top-ranked components are transplanted together. Returns rise steeply through K16 and flatten afterwards.</figcaption>
+  </figure>
+
+  <p>So we've identified the 16 components most responsible for this evasion behaviour: but can we narrow this down further?</p>
+
+  <p>K16 turns out to be 12 attention heads plus 4 MLPs. But a strong individual effect doesn't guarantee a strong contribution to the group (transplanting an MLP can, for instance, repair the downstream attention computation), so to find what really carries K16's effect I transplant the two subsets separately, as groups, on deception and harmfulness in both directions. The 12 heads alone reproduce 99% of K16's effect while the 4 MLPs contribute almost nothing. That's K12:</p>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_k16_dissection.svg" alt="Dot chart comparing recovery from transplanting all of K16, the 12 attention heads alone, and the 4 MLPs alone, across deception and harmfulness in both transfer directions. In every cell the 12 heads nearly overlap K16 while the MLPs sit near zero.">
+    <figcaption>Transplanting K16's two subsets separately. The 12 attention heads (blue) nearly perfectly overlap the full K16 group (grey) on all four cells; the 4 MLPs (orange) recover essentially nothing.</figcaption>
+  </figure>
+
+  <pre><code>Layer 9:  heads 4, 11, 13
+Layer 10: heads 2, 12
+Layer 11: heads 8, 9, 14, 15
+Layer 12: heads 2, 3, 12</code></pre>
+
+  <p>Transplanting exactly K12's output recovers 77.9% of the effect in one direction and 76.0% in the other. This convinces me it carries most of the mechanism directly, not merely correlating with it.</p>
+
+  <p>One confound remains: a random control rerouting sometimes preserves a large share of the effect, which raises the worry that K12's activity is just a generic, portable evasion signal that works wherever you insert it, and that these twelve heads are merely convenient sockets rather than specific machinery. A route-sensitivity check rules this out: reroute the intervention to non-original head/layer destinations and I get almost nothing on single-head transfers, a median of 13.9% for same-layer swaps, and only 2.1% for cross-layer swaps. K12's heads are not interchangeable sockets; the effect depends on the exact route the information takes.</p>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_rerouting.svg" alt="Dot plot of all 64 complete K12 rerouting arrangements. Same-layer arrangements preserve a median of 13.9 percent of the natural monitoring effect; cross-layer arrangements preserve a median of only 2.1 percent, with two arrangements below zero.">
+    <figcaption>Rerouting all twelve K12 writes through non-original arrangements. Each dot is one complete twelve-head rerouting evaluated on held-out concepts; vertical ticks mark medians. Same-layer swaps keep a little of the effect, cross-layer swaps keep almost none.</figcaption>
+  </figure>
+
+  <h2>III. What K12 computes</h2>
+
+  <h3>K12 is a template</h3>
+
+  <p>So we've identified the core components in the Gemma-2-9B Neural Chameleon responsible for ~77% of the evasion effect. But what are these heads actually doing? Are they computing some bespoke evasion strategy per response, or replaying something simpler, like a fixed learned vector per concept?</p>
+
+  <p>Is K12 constructing a detailed, response-specific evasion trajectory each time, or something cruder? A statistical model trained to predict K12's downstream displacement from its own activity pattern (per response, per token) only explains ~32% of the variance. A much simpler predictor, conditioned only on <em>which concept</em> is being monitored and <em>how far through the response</em> the model is (0-100%, bucketed into ten stages), explains ~59%. That surprised me.</p>
+
+  <p>Build an explicit ten-frame template per concept (average triggered-minus-ordinary K12 activity at each of the ten stages, averaged across other responses) and transplant <em>that</em> template instead of the real K12 activity, and you recover 0.9519 of the full monitor-displacement effect, against 0.0726 for a random-orientation control. So I read K12 as well approximated by "look up the concept, look up how far through the response you are, apply the corresponding write": a learned, reusable, per-concept steering vector, closer to hand-crafted Activation Addition than to a bespoke per-response computation.</p>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_template_recovery.svg" alt="Forest plot of ten-frame template recovery versus random-orientation control across eleven concepts plus the macro average. Every concept recovers between 0.84 and 0.99 of the exact K12 effect, while controls stay near zero.">
+    <figcaption>Transplanting the ten-frame template instead of real K12 activity. Every concept recovers most of the exact K12 monitor-vector effect (0.84 to 0.99); the matched random-orientation control stays near zero.</figcaption>
+  </figure>
+
+  <h3>Sideways, not quieter</h3>
+
+  <p>Two very different mechanisms could look similar from the outside:</p>
+  <ol>
+    <li>shrinking the response's representation along its existing direction ("turn down the volume", with RMSNorm restoring scale downstream and fooling a linear probe reading the un-normalised residual),</li>
+    <li>pushing the representation sideways into an unrecognised direction while preserving its scale.</li>
+  </ol>
+
+  <p>Split K12's write into a radial component (parallel to the incoming representation) and a tangential component (perpendicular to it) and this is settled for me: the radial component retains almost none of the monitor effect, while the tangential component retains 0.9931 of it (against 0.1010 for a matched random control). K12 moves the representation sideways.</p>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_radial_tangential.svg" alt="Bar chart comparing how much of natural K12's monitor-facing effect is retained by the radial component (almost none), the tangential component (0.9931), and a random-orientation control (0.1010).">
+    <figcaption>Decomposing K12's write into radial and tangential parts. The tangential component retains 0.9931 of the effect; the radial component retains almost none; the random-orientation control sits at 0.1010.</figcaption>
+  </figure>
+
+  <h3>How attention builds the write</h3>
+
+  <p>As we all recall:</p>
+  \[
+  a_{ij} = \text{softmax}_j\!\left(\frac{q_i^\top k_j}{\sqrt{d_h}}\right), \qquad
+  z_i = \sum_j a_{ij} v_j, \qquad
+  \Delta r_i = W_O z_i
+  \]
+  <p>In plain terms: Q asks what's relevant, K determines where to read from, V supplies what gets retrieved, and O turns the result into the residual-stream write.<sup><a href="#fn3">3</a></sup> Four things could explain how the monitoring instruction changes K12's output: it changes the queries, the keys, the values, or some combination.</p>
+
+  <p>A factorial test transplants every non-empty combination of donor Q, K and V (with the response teacher-forced) and measures how much of K12's monitor-facing effect comes back. That is, for each of the seven combinations I run the model with those factors taken from the monitored run and everything else from the ordinary run, then check how much of the monitor shift returns. Results:</p>
+
+  <table>
+    <tr><th>Donor factors</th><th>Monitor-effect recovery</th><th>K12 recovery</th><th>Sufficient both ways?</th></tr>
+    <tr><td>Q</td><td>&minus;0.003 / 0.020</td><td>0.061 / 0.076</td><td>No</td></tr>
+    <tr><td>K</td><td>0.205 / 0.182</td><td>0.186 / 0.336</td><td>No</td></tr>
+    <tr><td>V</td><td>0.596 / 0.718</td><td>0.431 / 0.637</td><td>No</td></tr>
+    <tr><td>Q, K</td><td>0.189 / 0.261</td><td>0.214 / 0.436</td><td>No</td></tr>
+    <tr><td>Q, V</td><td>0.563 / 0.710</td><td>0.509 / 0.701</td><td>No</td></tr>
+    <tr><td><strong>K, V</strong></td><td><strong>0.819 / 0.841</strong></td><td><strong>0.768 / 0.778</strong></td><td><strong>Yes</strong></td></tr>
+    <tr><td>Q, K, V</td><td>0.907 / 0.928</td><td>0.896 / 0.922</td><td>Yes</td></tr>
+  </table>
+
+  <p>Keys and values together are the smallest combination that passes the causal test in both directions. So I take the monitoring instruction as rewriting prompt-side memory (how it's addressed via K, and what it returns when addressed via V), and the response's own, unmodified queries read that rewritten memory to produce most of K12's write. Attention here functions as a joint source-side K/V rewrite, read out by ordinary queries.</p>
+
+  <h3>No single switch</h3>
+
+  <p>Prior work has found single residual-stream directions that toggle behaviours like refusal,<sup><a href="#fn4">4</a></sup> so I wondered whether one earlier component compresses the monitoring instruction into a simple "gate" for K12. Transplanting each layer's whole attention or MLP output individually, one at a time, gets nowhere near that: the strongest single component (layer 8's MLP) only reproduces 15.3% of the effect in the weaker direction. The conditioning signal looks genuinely distributed across the residual stream rather than living in one compact controller, though I wouldn't rule out a smaller switch (a single direction, or a small neuron group).</p>
+
+  <figure>
+    <img src="ai-safety/inside_neural_chameleon/nc_single_switch.svg" alt="Scatter plot of K12 effect recovered by transplanting each layer's whole MLP output (blue) or whole attention output (orange), layers 0 through 11, in both transfer directions. The strongest component, layer 8's MLP, reaches only 0.228 in the stronger direction and 0.153 in the weaker one.">
+    <figcaption>Transplanting each layer's whole MLP or attention output one at a time, in both directions (faded = weaker direction). Nothing comes close to a single controlling switch: the peak, layer 8's MLP, recovers only 15.3% of K12's effect in the weaker direction.</figcaption>
+  </figure>
+
+  <h2>IV. Summarising our findings on K12</h2>
+
+  <p>Putting it together, here's how I now think of K12:</p>
+  <ul>
+    <li><strong>An additive writer</strong>: it adds a vector to the residual stream, it doesn't gate or delete anything.</li>
+    <li><strong>Concept-and-position conditioned</strong>: the useful part of its write depends mainly on which concept is being monitored and roughly how far through the response the model is, not on fine response-specific detail.</li>
+    <li><strong>Mostly tangential</strong>: it moves the representation sideways, it doesn't shrink it.</li>
+    <li><strong>Constructed through K/V</strong>: the monitoring instruction rewrites prompt-side keys and values; the response's ordinary queries read that rewrite to produce the write.</li>
+    <li><strong>Route-sensitive</strong>: moving the same state to a different head or layer weakens or destroys the effect.</li>
+    <li><strong>Fed by a distributed conditioning interface</strong>: the full residual state suffices to trigger it, but no single early attention head or MLP does.</li>
+  </ul>
+
+  <h2>V. The rest of the effect</h2>
+
+  <p>K12 accounts for roughly 76-78% of the total monitor shift, so I wanted to know where the remaining ~22-24% comes from: the residual entering layer 9, the tail MLPs, or the other attention heads in layers 9-12?</p>
+
+  <table>
+    <tr><th>Intervention</th><th>Monitor-effect recovery</th></tr>
+    <tr><td>Exact K12 (12 heads)</td><td>0.779 / 0.760</td></tr>
+    <tr><td>K12 + remaining 52 tail heads</td><td>0.935 / 0.944</td></tr>
+    <tr><td>Complete layers 9-12 attention tail</td><td>1.000 / 1.000</td></tr>
+  </table>
+
+  <p>Only the other attention heads close most of the remaining gap; the MLPs stay irrelevant. So the picture I end up with is K12 doing the bulk of the targeted work, with the other 52 tail heads contributing diffusely in parallel to bring total recovery to about 94%. The effect survives with downstream RMSNorm scaling frozen, which rules out "K12 only looks important because normalisation amplifies it," and it moves the monitor score in the correct direction for all eleven trained concepts, not just the four used to find K12 in the first place.</p>
+
+  <h2>VI. Where fine-tuning made the change</h2>
+
+  <p>If you recall, the Neural Chameleon checkpoint I am dissecting was produced by fine-tuning Gemma-2-9B to evade the benign-concept probes, so somewhere in that fine-tuning the model learned the whole K12 mechanism. Where, exactly? Given K12 executes the write, my obvious guess was that fine-tuning directly rewrote its weights. Swap K12's own \(W_Q, W_K, W_V, W_O\) slices back to their pre-fine-tuning values and you only remove 23% of K12's effect. K12's weights matter, but they're not where most of the learning happened.</p>
+
+  <p>Swap back larger regions of the network instead and the real story shows up: replacing blocks 0-8 with their pre-fine-tuning versions collapses both K12's activity and the monitor effect almost completely (down to 0.02 and 0.01 recovery respectively), far more than swapping back any other region. Fine-tuning mostly changed the <em>early</em> blocks, teaching them to turn the monitoring instruction into a residual state that K12 can read, while K12 itself learned comparatively little new; it's mainly executing a write using machinery it already had, conditioned on a signal the early blocks learned to produce.</p>
+
+  <h2>VII. Takeaways</h2>
+
+  <p>To summarise our findings, early blocks (0-8) turn the monitoring instruction into a distributed contextualised state; this rewrites prompt-side keys and values; the response's ordinary queries read that rewritten memory; K12 (plus 52 other tail heads working diffusely) turns the result into a concept-and-position-dependent, mostly tangential write to the residual stream; the activation monitor, reading the un-normalised residual at that point, misses the concept entirely while the visible output is unaffected.</p>
+
+  <p>It's a genuinely learned, general-purpose piece of internal machinery for defeating an as-yet-unseen classifier, not a shortcut specific to the training probes. This is particularly concerning as a linear-probe-based activation monitor, deployed without awareness of this failure mode, would not catch this kind of emergent capability.</p>
+
+  <p>To be clear, this covers one released Gemma-2-9B checkpoint, one family of linear monitors at one residual site, eleven fine-tuning concepts, and mostly teacher-forced interventions. The natural next step is repeating the analysis on other Neural Chameleon checkpoints to see whether the same broad stages recur (distributed early conditioning, then a source-side K/V rewrite, then a late internally-generated steering write) or whether a different training run finds an entirely different mechanism for the same behaviour.</p>
+
+  <h3>Footnotes</h3>
+  <ol class="footnotes">
+    <li id="fn1">"Neural Chameleons" (McGuinness et al.) tested evasion primarily against unseen linear probes; it also transferred to some probe ensembles, MLPs, and attention monitors. See the paper on <a href="https://arxiv.org/abs/2512.11949">arXiv</a> and <a href="https://neuralchameleons.com">neuralchameleons.com</a>.</li>
+    <li id="fn2">"Discovery" concepts (used to rank and select K12): HTML, biology-focused, comforting, German. "Validation" concepts (held out entirely): all-caps, chemistry-based, confused, Finnish, jokey, literature-focused, mathematical.</li>
+    <li id="fn3">Q, K, V here refer to the activations produced on a given forward pass, not the learned weight matrices (model weights are held fixed throughout all the transplantation experiments). The Q/K/V split is inspired by the QK/OV circuit decomposition in Elhage et al., <a href="https://transformer-circuits.pub/2021/framework/index.html">A Mathematical Framework for Transformer Circuits</a>, 2021.</li>
+    <li id="fn4">Related prior work on single-direction behavioural switches: <a href="https://arxiv.org/abs/2406.11717">Refusal in Language Models Is Mediated by a Single Direction</a>; on rerouting representations: <a href="https://arxiv.org/abs/2406.04313">Representation Rerouting</a>; on hand-constructed steering vectors: <a href="https://arxiv.org/abs/2308.10248">Activation Addition</a>.</li>
+  </ol>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      renderMathInElement(document.body, {
+        delimiters: [
+          {left: "\\[", right: "\\]", display: true},
+          {left: "\\(", right: "\\)", display: false}
+        ]
+      });
+    });
+  </script>
+</body>
+</html>

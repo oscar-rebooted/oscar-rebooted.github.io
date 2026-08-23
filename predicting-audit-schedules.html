@@ -26,7 +26,7 @@
 <body>
   <p><a href="index.html">Home</a> · <a href="ai-safety.html">AI Safety</a></p>
   <h1>Measuring current model's abilities to predict audit schedules</h1>
-  <p class="meta">17 Aug 2026</p>
+   <p class="meta">4 Aug 2026</p>
   <p class="meta">Topics: scalable oversight, auditing</p>
 
   <p>Inspired by a SPAR project proposal from Jess Bergs and Konstantinos Voudouris (<a href="https://sparai.org/projects/f26/recyQRpX2HbOZfHYp/">link</a>), I decided to look into various ideas around understanding language models' capabilities and willingness to evade audit schedules.</p>
@@ -85,7 +85,7 @@
   <p>A natural first audit schedule, and a more common one if the dangers of misalignment are not top of mind, is to audit every n-steps, or more generally repeat some n-length pattern. Given known language model weaknesses around counting and context lengths, it would be interesting to see if there exists some simple relationship between how test-time compute increases with block length, and if we observe any non-linearities.</p>
 
   <figure>
-    <img src="ai_safety_experiments/fig1_block_length.png" alt="Reasoning cost and success rate vs. block length">
+    <img src="ai-safety/predicting_audit_schedules/fig1_block_length.png" alt="Reasoning cost and success rate vs. block length">
   </figure>
 
   <p>As expected, reasoning cost scales roughly log-linearly with block length. More remarkably, success rates barely erode even at 500-1000 length blocks (sequences of 1.5-3K tokens), despite the precise recall required over long sequences. From the reasoning trace we can also see that the handful of errors that do happen are because the model locks onto a certain pattern too early and stops checking longer periods.</p>
@@ -94,7 +94,7 @@
   <p>More broadly, I wanted to compare how current models perform given various complexities.</p>
 
   <figure>
-    <img src="ai_safety_experiments/fig2_schedule_complexity.png" alt="Model performance across schedule complexity types">
+    <img src="ai-safety/predicting_audit_schedules/fig2_schedule_complexity.png" alt="Model performance across schedule complexity types">
     <figcaption>See footnotes for definition of each sequence</figcaption>
   </figure>
 
@@ -123,7 +123,8 @@
   <p>So I thought I'd try being a guinea pig and generate some data to test on. I spent 15 minutes creating 50 binary sequences by pressing the keys on my keyboard as randomly as possible, to see if a language model would be able to predict my next "random" move. Quite surprisingly, it did pretty well.</p>
 
   <figure>
-    <img src="ai_safety_experiments/fig3_human_examples.png" alt="Model prediction accuracy on human-generated sequences">
+    <img src="ai-safety/predicting_audit_schedules/fig3_human_examples.png" alt="Model prediction accuracy on human-generated sequences">
+    <figcaption>Random sequences generated with same audit probability as audit frequency of "human random" sequences (p=0.53)</figcaption>
   </figure>
 
   <p>Kimi K3 was able to predict the next round in ~70% of cases. Although I included in the prompt the information that the sequence was human-generated, what's particularly interesting is the fact it outperformed a simple alternation strategy (though not statistically significantly<sup>3</sup>), showing it's ability to identify additional patterns in my specific behaviour.</p>
